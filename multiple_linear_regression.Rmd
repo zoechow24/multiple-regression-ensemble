@@ -1,0 +1,283 @@
+---
+title: "Ensemble Multiple Linear Regression"
+author: "Zoe Chow"
+date: "Summer 2025"
+output:
+  html_document:
+    df_print: paged
+subtitle: DA5030
+---
+#### _The goal of this project is to build an ensemble model that combines three linear regression models to predict the target variable._
+
+## Load Packages and CSV
+```{r LoadPackages, warning=F, message=F}
+library(dplyr)
+library(kableExtra)
+library(knitr)
+library(psych)
+library(caret)
+```
+
+```{r LoadCSV}
+train_url <- "https://s3.us-east-2.amazonaws.com/artificium.us/datasets/synth-data.csv"
+df <- read.csv(train_url, stringsAsFactors = F, header = T)
+```
+
+## Data Preparation
+Linear regression models are sensitive to noisy data and require numeric features. Therefore, we will need to handle missing values and outliers, as well as encode characterized categorical data. We will also visualize the distribution of the data to ensure normality. If the data is not normally distributed, we will perform log and square root transformations on the data.
+
+### Exploratory Data Analysis (EDA)
+```{r EDA}
+head(df)
+summary(df)
+str(df)
+colSums(is.na(df))
+```
+According to the exploratory data analysis (EDA), there are no missing values in the dataset. The columns `B1` and `C1` are categorical, indicating that they will require encoding. Before moving on to check the outliers and distribution of data, we will remove the column `X` because it seems to be an identifier column. 
+
+```{r removeID}
+# using dplyr allows removal of columns by col name (don't want to risk removing the first col multiple times)
+df <- df%>%select(-X)
+```
+
+
+### Outliers
+I identified outliers in the numeric columns by calculating z-scores and flagging any values with an absolute z-score greater than 3.0 (|z| > 3.0).
+```{r outliers}
+outliers <- function(df) {
+  outliers <- c()
+  for (col in 1:ncol(df)) {
+    m <- mean(df[[col]], na.rm = TRUE)
+    s <- sd(df[[col]], na.rm = TRUE)
+    
+    # Compute z-scores and find outliers
+    z_scores <- abs((df[[col]] - m) / s)
+    outlierRows <- which(z_scores > 3.0)
+    
+    # append outlier row to a list 
+    outliers <- c(outliers, outlierRows)
+    
+    # Print results
+    col_name <- colnames(df)[col]
+    if (length(outlierRows) > 0) {
+      cat("Found outliers in column '", col_name, "':\n", sep = "")
+      cat("   --> ", df[outlierRows,col], "\n\n")
+    } else {
+      cat("No outliers found in column '", col_name, "'\n", sep = "")
+    }
+  }
+  
+}
+numeric_features <- names(df)[sapply(df, is.numeric)]
+outliers <- outliers(df[,numeric_features])
+```
+There are many outliers observed in the dataset; however, the outliers within each column are relatively close to one another in value. This may indicate that the outliers are not due to errors or noise but rather reflect natural variation within the data. As a result, I do not plan to handle these values.
+
+### Data Distribution and Correlation
+I used `pairs.panels` from the `psych` package to examine the distribution and correlation of the numeric features of the data. 
+```{r origdist, fig.align='center'}
+pairs.panels(df[,numeric_features])
+```
+According to the pairwise plot, `N1`, `N2`, and `N5` are normally distributed. Furthermore, there does not seem to be any multicollinearity depicted between the features. I will use log and square root transformations to see if the distributions improve. 
+
+```{r log_df, fig.align='center'}
+log_df <- log(df[,numeric_features]+1)
+pairs.panels(log_df)
+```
+
+```{r sqrt, fig.align='center'}
+sqrt_df <- sqrt(df[,numeric_features])
+pairs.panels(sqrt_df)
+```
+The distributions of the `N1`, `N2`, and `N5` columns did not improve significantly with any transformation. However, the distribution of `N3` improved the most with a log transformation, while `N6` showed the most improvement with a square root transformation. For `N4`, both log and square root transformations slightly reduced the skewness, although some irregularities remained. Between the two, the square root transformation produced a slightly more favorable distribution.
+
+Now that the most effective transformations for improving the distributions have been identified, we will create a new data frame containing the transformed features to be used for model training.
+```{r transformed, fig.align='center'}
+df_transformed <- df %>%
+  mutate(N3 = log(N3+1), # log transform
+         N4 = sqrt(N4),  # sqrt transform
+         N6 = sqrt(N6))  # sqrt transform
+pairs.panels(df_transformed[,numeric_features])
+```
+
+### Encoding
+After transforming the numeric features, we will now encode the categorical features `B1` and `C1.` Since `B1` contains only two categories — "True" and "False" — we will apply binary encoding. We will convert "True" to 1 and "False" to 0, representing the two classes numerically. On the other hand, we will use one-hot encoding for the categorical feature `C1`, which has four ordered levels: "Level1", "Level2", "Level3", and "Level4". To do so, we will create three new binary columns corresponding to "Level1", "Level2", and "Level3". Each column will have a value of 1 if the data point belongs to that level, and 0 otherwise. The fourth level, "Level4", will be the baseline category and represented by zeros across all three columns. This approach effectively encodes the categorical variable while preventing redundancy in the regression model.
+```{r encode}
+df_transformed <- df_transformed %>% 
+  mutate(B1 = ifelse(B1 == "True", 1, 0),  # Binary
+         Level1 = ifelse(C1 == "Level1", 1, 0),  # One hot
+         Level2 = ifelse(C1 == "Level2", 1, 0),  # one hot 
+         Level3 = ifelse(C1 == "Level3", 1, 0)) %>%   # one hot
+  select(-C1)  # remove levelx column (not needed for linear regression)
+```
+
+### Split Data
+Now that the data preprocessing is complete, we will split the dataset into four parts: a testing set comprising 20% of the original data, and three equally sized, randomly sampled training subsets created from the remaining 80%. Each training subset will be used to train a separate regression model, enabling us to compare their performance consistently on the shared testing set.
+```{r splitdata}
+set.seed(2025)
+
+# create training subset 80%
+train_index <- sample(x = 1:nrow(df_transformed),
+                     size = (round(nrow(df_transformed)*0.8,0)),
+                     replace = F)
+train_df <- df_transformed[train_index,]
+
+# save test set
+test_df <- df_transformed[-train_index,]
+
+# divide the remaining 80% (training set) into 3 partitions 
+n.partitions <- 3
+
+## create lists to hold partitions
+partitions <- list()
+oob <- list()
+
+# generate partitions w/ replacement
+for (i in 1:n.partitions){
+  sampled_index <- sample(1:nrow(train_df),
+                          size = nrow(train_df),
+                          replace = T)
+  partitions[[i]] <- train_df[sampled_index,]
+  oob[[i]] <- train_df[-sampled_index,]
+}
+```
+
+## Model Training
+Using the training samples, we will train three multiple linear regression models. For each model, we apply stepwise backward elimination on its respective bootstrap sample to select only statistically significant features. This allows each model to adapt to the variability in the data, potentially improving ensemble diversity and robustness.
+```{r stepwise}
+stepwise_backwards <- function(data, target, threshold){
+  # start with previous_many removed
+  formula <- paste(target, "~ .")
+  model <- lm(as.formula(formula), data = data)
+  
+  # Loop until all p-values <= threshold
+  repeat {
+    p_values <- summary(model)$coefficients[-1, 4]  # exclude intercept
+    max_p <- max(p_values)
+    
+    if (max_p <= threshold) {
+      break
+    }
+    
+    # Find the predictor with max p-value
+    remove_var <- names(which.max(p_values))
+    
+    # Update formula by removing this variable
+    formula <- paste(formula, " -", remove_var)
+    
+    # Refit model
+    model <- lm(as.formula(formula), data = data)
+  }
+  
+  return(model)
+}
+```
+
+```{r train}
+# Create a list to hold the models
+models <- list()
+
+# Fit a linear regression model on each training partition
+for (i in 1:length(partitions)) {
+  train.data <- partitions[[i]]
+  model <- stepwise_backwards(train.data, "Target", 0.5 ) # perform stepwise backwards elimination for each model
+  models[[i]] <- model
+}
+```
+
+## Ensemble
+Now that the models have been trained, we will build an ensemble model to predict the target feature. The ensemble will combine the predictions from all three regression models by taking the average of their predicted values for each observation. This averaging approach helps to reduce variance and improve the overall stability and accuracy of the predictions.
+```{r ensemble}
+lm.ensemble <- function(models, new.data) {
+
+  # Compute RMSE for each model on its training data
+  rmses <- sapply(models, function(model) {
+    target.act <- model$model$Target
+    target.pred <- predict(model, newdata = model$model)
+    sqrt(mean((target.act - target.pred)^2))
+  })
+
+  # Convert RMSEs to weights: inverse of RMSE (higher weight for lower error)
+  inv.rmses <- 1 / rmses
+  weights <- inv.rmses / sum(inv.rmses)
+
+  # Predict with each model on new data
+  predictions <- sapply(models, function(model) {
+    predict(model, newdata = new.data)
+  })
+
+  # Ensure predictions are in matrix form
+  if (is.vector(predictions)) {
+    predictions <- matrix(predictions, nrow = 1)
+  }
+
+  # Apply weights to compute weighted average prediction
+  weighted.preds <- predictions %*% weights
+  as.vector(weighted.preds)
+}
+```
+
+## Evaluation
+We will use the ensemble model to generate predictions on the test set and evaluate its performance. This will allow us to assess how well the ensemble generalizes to unseen data.
+```{r predict}
+test_predicted <- lm.ensemble(models, test_df)
+```
+
+To evaluate the prediction model, we will use RMSE to see how far off the predictions are on average and $\text{R}^2$ to see how much variation can be explained by the ensemble. 
+```{r eval}
+actual <- test_df$Target
+
+# RMSE and r2 calculations
+ensemble_RMSE <- round(sqrt(mean((actual - test_predicted)^2)),2)
+ensemble_r2 <- round(1 - (sum((actual-test_predicted)^2)/sum((actual-mean(actual))^2)),2)
+
+# save in df for display
+ensemble_eval <- data.frame(RMSE = ensemble_RMSE, 
+                            Rsquared = ensemble_r2)
+kable(ensemble_eval, caption = "Ensemble Evaluation")%>%
+  kable_styling()
+```
+The RMSE and $\text{R}^2$ values are shown in the table above. The scores suggests that the regression ensemble performed very well and that the predictions were approximately `r ensemble_RMSE` from the actual target values. Given that the target variable ranges from 75 to 350, this level of error is relatively small. Additionally, the exceptionally high $\text{R}^2$ value of `r ensemble_r2` suggests that the ensemble model captures nearly all of the variability in the target variable, demonstrating strong predictive performance.
+
+## Model Validation
+Using the ensemble model, we will generate predictions for the target variable in the validation set and calculate the RMSE to evaluate the model’s predictive accuracy. Before making predictions, we will preprocess the validation data in the same way as the training set to ensure consistency in feature scaling, encoding, and transformations.
+
+```{r val_df}
+val_url <- "https://s3.us-east-2.amazonaws.com/artificium.us/datasets/synth-data-validation-500.csv"
+val_df <- read.csv(val_url, stringsAsFactors = F, header = T)
+```
+
+### Data Preprocessing
+```{r handle_val}
+# remove ID
+train.val_df <- val_df %>% select(-X)
+
+# transform numeric columns
+train.val_df <- train.val_df %>%
+  mutate(N3 = log(N3+1),
+         N4 = sqrt(N4),
+         N6 = sqrt(N6))
+
+# encode categorical columns
+train.val_df <- train.val_df %>%
+  mutate(B1 = ifelse(B1 == "True", 1, 0),
+         Level1 = ifelse(C1 == "Level1", 1, 0),
+         Level2 = ifelse(C1 == "Level2", 1, 0),
+         Level3 = ifelse(C1 == "Level3", 1, 0)) %>%
+  select(-C1)
+```
+
+### Prediction
+```{r predict_val}
+val_predicted <- lm.ensemble(models, train.val_df)
+```
+
+### Evaluation
+```{r val_eval}
+val_actual <- train.val_df$Target
+val_RMSE <- round(sqrt(mean((val_actual - val_predicted)^2)),2)
+```
+
+**RMSE:** _`r val_RMSE`_
+
+This low RMSE indicates that the ensemble model maintained strong predictive performance on the validation data.
