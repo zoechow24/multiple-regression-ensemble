@@ -14,6 +14,14 @@ The following data was provided and was loaded using their URLs:
 * `multiple_linear_regression.Rmd` - R Notebook
 * `multiple_linear_regression.html` - knitted HTML report
 
+## Dependencies
+This project uses the following packages:
+* dplyr
+* kableExtra
+* knitr
+* psych
+* caret
+
 ## Methodology
 1. Load Data
 2. Data Preparation
