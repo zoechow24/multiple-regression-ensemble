@@ -30,10 +30,10 @@ This project uses the following packages:
    * Data Distribution and Correlation
    * Encode Categorical Data
    * Split Data into training and testing sets
-4. Train Multiple Linear Regression Models using Stepwise Backwards Elimination
-5. Build Ensemble Model
-6. Evaluate Model
-7. Model Validation
+3. Train Multiple Linear Regression Models using Stepwise Backwards Elimination
+4. Build Ensemble Model
+5. Evaluate Model
+6. Model Validation
    * Preprocess validation dataset
    * Make predictions
    * Evaluate using RMSE
